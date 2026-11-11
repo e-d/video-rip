@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -113,8 +114,11 @@ def build_args(mode, url, tmp_dir, referer=None, cookies_browser=None, name=None
         "--progress",
         "--no-colors",
         "--ffmpeg-location", FFMPEG_DIR,
-        "-P", str(OUT_DIR),
-        "-P", f"temp:{tmp_dir}",
+        # Download AND finish inside the attempt's own folder. If we pointed yt-dlp at
+        # OUT_DIR, an existing file with the same name would be reused ("has already
+        # been downloaded") instead of fetching this video.
+        "-P", str(tmp_dir),
+        "-P", f"temp:{tmp_dir / 'work'}",
         "-o", f"{safe_name(name)}.%(ext)s" if name else "%(title).150B [%(id)s].%(ext)s",
         "--progress-template", "download:VRPROG %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
         "--print", "video:VRTITLE %(title)s",
@@ -182,7 +186,7 @@ class JobLog:
             pass
 
 
-def run_attempt(job, args, label, log):
+def run_attempt(job, args, label, log, announce_title=True):
     """Run one yt-dlp invocation and report how far it got."""
     send({"type": "status", "text": label})
     log.write(f"\n===== {label}\n$ " + " ".join(shlex.quote(a) for a in args))
@@ -215,7 +219,8 @@ def run_attempt(job, args, label, log):
         if line.startswith("VRTITLE "):
             res["title"] = line[8:]
             res["stage"] = max(res["stage"], STAGE_INFO)
-            send({"type": "title", "title": res["title"]})
+            if announce_title:
+                send({"type": "title", "title": res["title"]})
         elif line.startswith("VRFILE "):
             res["filepath"] = line[7:]
         elif line.startswith("ERROR:"):
@@ -237,7 +242,8 @@ def run_attempt(job, args, label, log):
     if res["filepath"] and job.proc.returncode != 0:
         # The file was moved into place but something after that failed (rare). Keep it.
         res["error"] = ""
-    log.write(f"----- exit {job.proc.returncode}; stage: {STAGE_NAMES[res['stage']]}; "
+    outcome = "ok" if res["filepath"] else STAGE_NAMES[res["stage"]]
+    log.write(f"----- exit {job.proc.returncode}; result: {outcome}; "
               f"file: {res['filepath']}; error: {res['error'] or '-'}")
     return res
 
@@ -250,6 +256,15 @@ def unique_path(path):
         if not cand.exists():
             return cand
     return path.with_name(f"{path.stem} {uuid.uuid4().hex[:6]}{path.suffix}")
+
+
+def finalize(path, log):
+    """Move a finished file from its attempt folder into OUT_DIR without overwriting anything."""
+    src = Path(path)
+    dest = unique_path(OUT_DIR / src.name)
+    shutil.move(str(src), dest)
+    log.write(f"Saved -> {dest}")
+    return str(dest)
 
 
 def rescue_file(attempt_dir, title, mode, failed_pp, log):
@@ -283,6 +298,29 @@ def rescue_file(attempt_dir, title, mode, failed_pp, log):
     return moved[0]
 
 
+def is_hls_master(url, referer):
+    """True if the URL is an HLS master playlist. Sniffed streams often include both the
+    master and its single-quality sub-playlists (which may be video-only or audio-only)."""
+    if not re.search(r"\.m3u8(\?|#|$)", url, re.I):
+        return False
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/140.0 Safari/537.36"}
+    if referer:
+        headers["Referer"] = referer
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return b"#EXT-X-STREAM-INF" in r.read(256 * 1024)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def friendly(error):
+    if "unable to obtain file audio codec" in error:
+        return "This stream has no audio track (it's probably a video-only part of the player's stream)."
+    return error
+
+
 def do_download(job, msg):
     mode = "audio" if msg.get("mode") == "audio" else "video"
     page_url = msg.get("url")
@@ -309,8 +347,16 @@ def do_download(job, msg):
                          lambda d, plain: build_args(mode, page_url, d, plain=plain)))
         attempts.append((f"Retrying with your {browser.title()} login…", "cookies",
                          lambda d, plain: build_args(mode, page_url, d, cookies_browser=browser, plain=plain)))
+    def media_referer(m):
+        return m.get("referer") if is_http_url(m.get("referer")) else page_url if is_http_url(page_url) else None
+
+    flagged = [(is_hls_master(m["url"], media_referer(m)), m) for m in media]
+    flagged.sort(key=lambda f: not f[0])  # stable: masters first, otherwise keep order
+    media = [m for _, m in flagged]
+    for is_master, m in flagged:
+        log.write(f"stream order: {'MASTER ' if is_master else ''}{m['url'][:120]}")
     for i, m in enumerate(media, 1):
-        referer = m.get("referer") if is_http_url(m.get("referer")) else page_url if is_http_url(page_url) else None
+        referer = media_referer(m)
         attempts.append((f"Trying detected stream {i} of {len(media)}…", "media",
                          lambda d, plain, u=m["url"], r=referer: build_args(mode, u, d, referer=r, name=page_title, plain=plain)))
 
@@ -326,14 +372,14 @@ def do_download(job, msg):
                 continue
             attempt_dir = job_tmp / f"attempt{order}"
             attempt_dir.mkdir(parents=True, exist_ok=True)
-            res = run_attempt(job, make_args(attempt_dir, False), label, log)
+            res = run_attempt(job, make_args(attempt_dir, False), label, log, announce_title=kind != "media")
 
             # Fix: if an optional step (cover art / metadata) broke conversion, retry without it.
             # The download is reused from attempt_dir, so this is quick.
             if (not job.cancelled and not res["filepath"] and res["stage"] == STAGE_POSTPROCESS
                     and res["last_pp"] in OPTIONAL_PP):
                 res = run_attempt(job, make_args(attempt_dir, True),
-                                  "Retrying without cover art / tags…", log)
+                                  "Retrying without cover art / tags…", log, announce_title=kind != "media")
 
             title = res["title"] or title
             if job.cancelled:
@@ -341,6 +387,7 @@ def do_download(job, msg):
             if res["filepath"]:
                 if kind == "media" and page_title:
                     title = page_title
+                res["filepath"] = finalize(res["filepath"], log)
                 log.write(f"\n===== DONE: {res['filepath']}")
                 send({"type": "done", "path": res["filepath"],
                       "title": title or os.path.basename(res["filepath"]), "log": log_path})
@@ -354,7 +401,7 @@ def do_download(job, msg):
 
         # Report the error from the attempt that got furthest (ties -> the later attempt).
         ranked = sorted(results, key=lambda r: (r[3]["stage"], r[0]), reverse=True)
-        details = [{"label": lbl.rstrip("…"), "error": res["error"] or "Unknown error",
+        details = [{"label": lbl.rstrip("…"), "error": friendly(res["error"]) or "Unknown error",
                     "stage": STAGE_NAMES[res["stage"]]} for _, lbl, _, res, _ in results]
 
         # If something fully downloaded but couldn't be converted, keep the original file.
@@ -365,14 +412,14 @@ def do_download(job, msg):
             rescued = rescue_file(attempt_dir, name, mode, res["last_pp"], log)
             if rescued:
                 want = "MP3" if mode == "audio" else "MP4"
-                warning = f"Couldn't convert to {want} ({res['error'] or 'unknown error'}). Saved the original file instead."
+                warning = f"Couldn't convert to {want} ({friendly(res['error']) or 'unknown error'}). Saved the original file instead."
                 log.write(f"\n===== RESCUED: {rescued}")
                 send({"type": "done", "path": rescued, "title": name or os.path.basename(rescued),
                       "warning": warning, "log": log_path, "details": details})
                 return
 
         best = ranked[0][3] if ranked else {"error": "Nothing to try", "stage": STAGE_NONE}
-        error = best["error"] or "Unknown error"
+        error = friendly(best["error"]) or "Unknown error"
         if best["stage"] >= STAGE_DOWNLOADING:
             error = f"{error} ({STAGE_NAMES[best['stage']]})"
         log.write(f"\n===== FAILED: {error}")
