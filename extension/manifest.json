@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "VideoRip",
+  "version": "1.0.0",
+  "description": "Save the audio (MP3) or video (MP4) from the current tab using a local yt-dlp helper.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxpNQ/as+sV7kfjV8oaltDF/T78Me5p/mgI+8qFUUTXVwvMCGHYS9tTNp6PhFroxk/0ToUfF9rHInn9n6JMyueXa8SWXff/xpSKodZyj2MWU6iZ2tN17ofFJ6gm98lm8CsfRrfUvESHwvYmLDnGWr6dIMAD54NtTcbUspMuSXKCsjVX7oYiIH4rscyN9UAYHs2IyNa0pmoca89/bENpe/oE2Q0hf33CLjjPHGj7rsQ2m8BL1ShU9l2lu6DXSv5AO/ls+VeysuKeloUsBfyOdWDmtDS/Aq0wTfoELNPGf9EocbGHVaEVcRNXHqcr9GdEEqiX6Qvhg3EHSI1oTpqBeOdwIDAQAB",
+  "permissions": ["nativeMessaging", "tabs", "storage", "notifications", "webRequest", "contextMenus"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "VideoRip",
+    "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "commands": {
+    "save-audio": { "suggested_key": { "default": "Alt+Shift+A" }, "description": "Save audio from current tab" },
+    "save-video": { "suggested_key": { "default": "Alt+Shift+V" }, "description": "Save video from current tab" }
+  }
+}
