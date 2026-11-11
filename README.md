@@ -73,3 +73,7 @@ tools/make_icons.py Regenerates the icons
 ```
 
 The extension talks to the helper through Chrome **native messaging**. No local server or open port is involved, and only this extension's fixed ID can start the helper. If you move this folder, run `./install.sh` again.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
